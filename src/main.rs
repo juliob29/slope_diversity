@@ -30,13 +30,16 @@ https://girlswhocode.com/
 
 
 */
-use std::thread;
+use std::{io::Write, thread};
 use crossbeam::channel; // For communucation with CS Department Thread
 use std::collections::HashMap; // For storing data to eventually run statistics. 
 use std::io;
 use rand::Rng;
 use std::time::Duration;
-use std::fs::File;
+use std::fs::OpenOptions;
+
+//* Would be good to count how many threads fail. Value protected by mutex.
+use std::sync::{Arc, Mutex};
 
 /// study function. Each thread will run this individually, which will force them to study!
 /// Returns number of points that should be added to their total
@@ -46,7 +49,6 @@ fn study(points: f64) -> f64 {
     let time_to_sleep_seconds = num as f64 / points; //* the more points you have, the less you need to study!
     
     thread::sleep(Duration::new(time_to_sleep_seconds as u64, 0)); 
-
     let upper = 20.0 / (1.0 + points.powf(0.5)); 
     rng.gen_range(0.0, upper) as f64
 }
@@ -57,14 +59,20 @@ fn study(points: f64) -> f64 {
 /// identifier: String -> How a thread will be known in data collection (LOW_GROUP_1)
 /// points: u32 -> The initial amount of points this student was spawned with. 
 
-fn student_thread_routine(identifier: String, mut points: f64, channel_tuple: (crossbeam::channel::Sender<(String, u32, f64)>, crossbeam::channel::Receiver<bool>)) {
+fn student_thread_routine(identifier: String, mut points: f64, channel_tuple: 
+                          (crossbeam::channel::Sender<(String, u32, f64)>, 
+                           crossbeam::channel::Receiver<bool>), 
+                           num_failures: Arc<Mutex<u32>>) {
+
     //* Channel for a student to recieve info on if they've passed a class. 
     let mut curr_class_idx = 0; 
-    let mut num_tries = 3;
-    
+    let mut num_tries = 2;
+
     loop {
         points += study(points);
-        channel_tuple.0.send((identifier.clone(), curr_class_idx, points)).expect("Sending to CS DEPT failed");
+        channel_tuple.0.send((identifier.clone(), curr_class_idx, points)).
+                            expect("Sending to CS DEPT failed");
+
         let ret = channel_tuple.1.recv().expect("Failed to recieve.");
         //* We've failed the class...
         if !ret {
@@ -74,6 +82,8 @@ fn student_thread_routine(identifier: String, mut points: f64, channel_tuple: (c
         }
         if num_tries == 0 {
             println!("{} has ran out of tries and quit the CS major.", identifier);
+            let mut num_failures = num_failures.lock().unwrap();
+            *num_failures += 1;
             return;
         }
         if curr_class_idx == 3 {
@@ -91,7 +101,7 @@ fn get_number(message: &str) -> f64 {
         let mut buf = String::from("");
         stdin.read_line(&mut buf).expect("Reading from STDIN failed... Try again, that should be rare.");
         let value =  buf.trim().parse(); 
-        
+   
         match value {
             Ok(val) => return val,
             Err(_msg) => {
@@ -101,15 +111,26 @@ fn get_number(message: &str) -> f64 {
     }
 }
 
-fn cs_dept_thread_routine(tables: &mut (HashMap<String, crossbeam::channel::Sender<bool>>, HashMap<String, Vec<f64>>), receiver_dpt: crossbeam::channel::Receiver<(String, u32, f64)>) {
+//* The cs_dept_thread is the one managing all of the vector information. 
+fn cs_dept_thread_routine(tables: &mut (HashMap<String, crossbeam::channel::Sender<bool>>, HashMap<String, Vec<f64>>), 
+                          receiver_dpt: crossbeam::channel::Receiver<(String, u32, f64)>, 
+                          num_failures: Arc<Mutex<u32>>) {
     loop {
         let tuple = receiver_dpt.recv().unwrap();
         //* main thread will send this when the routine should end.
         if tuple.0 == "" {
             println!("CS Dept Thread Finished.");
-            println!("Printing Progress Table in JSON to new File");
-            let file = File::create("table.txt").expect("File creation failed");
-            serde_json::to_writer(file, &tables.1).expect("Writing table to file failed");
+            println!("Printing Progress Table in JSON to new File: table.txt");
+            let mut file = OpenOptions::new().write(true)
+                                                        .create(true)
+                                                        .truncate(true)
+                                                        .open("table.txt")
+                                                        .expect("Couldn't create table.txt file.");
+
+            serde_json::to_writer(&file, &tables.1).expect("Writing table to file failed");
+            let num_failures = num_failures.lock().unwrap();
+            let msg = format!("\n The number of students that quit the major was: {}", num_failures);
+            file.write(msg.as_bytes()).expect("Writing number of failed students to file failed.");
             return;
         } 
 
@@ -120,6 +141,7 @@ fn cs_dept_thread_routine(tables: &mut (HashMap<String, crossbeam::channel::Send
 
         //* Probability to pass class is based on a log function, log(x / y), where y 
         //* depends on which class you're taking. 
+        //* tuple.2 is the amount of points this student has. */
         let probability = (tuple.2 / tuple.1 as f64).log10();
         let mut rng = rand::thread_rng();
         let hit = rng.gen_range(0.0, 1.0);
@@ -138,7 +160,6 @@ fn main() {
     let mut student_threads = Vec::new(); 
 
     //* Lets read from input, so that users can be allowed to change pt values for different groups. 
-    
     let low_pts = get_number("Enter value for LOW group.");
     let med_pts = get_number("Enter value for MEDIUM group");
     let high_pts = get_number("Enter value for HIGH group");
@@ -152,6 +173,10 @@ fn main() {
     //* .1 -> Table with point values for each thread to track growth. 
     let mut tables  = (HashMap::new(), HashMap::new());
 
+    //* Finally, create global num_failures count to check how many students failed
+
+    let num_failures = Arc::new(Mutex::new(0 as u32));
+
 
     //* Spawn in each group of threads. 
     // LOW_GROUP_1, MED_GROUP_1, HIGH_GROUP_1...
@@ -164,6 +189,7 @@ fn main() {
         for i in 0..all_strs.len() {
             let identifier = all_strs[i].clone();
             let point_value = point_values[i];
+            let num_failures_copy = num_failures.clone();
 
             let (sender_stud, reciever_stud) = channel::unbounded::<bool>();
             tables.0.insert(identifier.clone(), sender_stud.clone()); 
@@ -171,13 +197,17 @@ fn main() {
 
             let sender_copy = sender_dpt.clone();
             student_threads.push(thread::spawn(move || {
-                student_thread_routine(identifier,  point_value, (sender_copy, reciever_stud));
+                student_thread_routine(identifier,  
+                                point_value,
+                                (sender_copy, reciever_stud),
+                                num_failures_copy);
             }));
         }
     }
+
     //* After all threads have been made, we can create the CS Dept Thread, and give it ownership of the table.
     let cs_dept = thread::spawn(move ||  {
-        cs_dept_thread_routine(&mut tables, reciever_dpt);
+        cs_dept_thread_routine(&mut tables, reciever_dpt, Arc::clone(&num_failures));
     });
     for thread in student_threads {
         thread.join().expect("A thread panicked!");
